@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import logging
+from tracking_code import utils
 
 LOGGER = logging.getLogger("TrackingReader")
 
@@ -59,7 +60,7 @@ class TrackingReader:
 
         return tracking_data
 
-    def __adjust_direction(self, input_data, middle_x=53.0, middle_y=30.0):
+    def __adjust_direction(self, input_data, middle_x=53.0, middle_y=34.0):
         """Mirror positions in second half so they correspond to the direction
         in first half
 
@@ -100,16 +101,11 @@ class TrackingReader:
             pd.DataFrame: Adusted data
         """
         LOGGER.info("Adjusting coordinates")
-        input_data[
-            [col for col in input_data.columns if col[-2:] == "_x"]
-        ] = input_data[[col for col in input_data.columns if col[-2:] == "_x"]].apply(
-            lambda x: round((x) * pitch_length, 1)
-        )
-        input_data[
-            [col for col in input_data.columns if col[-2:] == "_y"]
-        ] = input_data[[col for col in input_data.columns if col[-2:] == "_y"]].apply(
-            lambda x: round((x) * pitch_width, 1)
-        )
+
+        x_columns = [col for col in input_data.columns if col[-2:] == "_x"]
+        y_columns = [col for col in input_data.columns if col[-2:] == "_y"]
+        input_data[x_columns] = (input_data[x_columns] - 0.5) * pitch_length
+        input_data[y_columns] = -1 * (input_data[y_columns] - 0.5) * pitch_width
 
         return input_data
 
@@ -153,6 +149,110 @@ class TrackingReader:
 
         return simp
 
+    def postprocess_tracking_data(self, pitch_length=106, pitch_width=68):
+        """Postprocess tracking data:
+        - extract available players
+        - calculate movement per second
+        """
+        x_columns = [col for col in self.processed_data.columns if col[-2:] == "_x"]
+        y_columns = [col for col in self.processed_data.columns if col[-2:] == "_y"]
+
+        self.processed_data[x_columns] = self.processed_data[x_columns].apply(
+            lambda x: np.where(
+                (x > (pitch_length * 0.05) + pitch_length / 2)
+                | (x < -((pitch_length * 0.05) + pitch_length / 2)),
+                np.nan,
+                x,
+            )
+        )
+
+        self.processed_data[y_columns] = self.processed_data[y_columns].apply(
+            lambda x: np.where(
+                (x > (pitch_width * 0.05) + pitch_width / 2)
+                | (x < -((pitch_width * 0.05) + pitch_width / 2)),
+                np.nan,
+                x,
+            )
+        )
+
+        self.processed_data = self.processed_data.dropna(
+            subset=x_columns + y_columns, how="all"
+        ).reset_index(drop=True)
+
+        self.available_players = list(
+            set(
+                [
+                    col.replace("Player", "").replace("_x", "").replace("_y", "")
+                    for col in self.processed_data.columns
+                    if col[:6] == "Player"
+                ]
+            )
+        )
+
+        for player in self.available_players:
+            self.processed_data[
+                f"Player{player}_movement"
+            ] = self.calculate_distance_per_player(player_no=player)["distances"]
+
+    def create_player_table(self):
+        """Gather tracking stats for all players
+
+        Returns:
+            pd.DataFrame: player table
+        """
+
+        player_dict = {}
+
+        for player in self.available_players:
+
+            first_index = self.processed_data[f"Player{player}_x"].first_valid_index()
+            last_index = self.processed_data[f"Player{player}_x"].last_valid_index()
+            if first_index is not None:
+                player_dict[player] = {}
+                first_second = self.processed_data[f"Second"][first_index]
+                last_second = self.processed_data[f"Second"][last_index]
+                player_dict[player]["entered"] = round(first_second / 60, 0)
+                player_dict[player]["left"] = round(last_second / 60, 0)
+
+                player_dict[player]["minutes_played"] = (
+                    player_dict[player]["left"] - player_dict[player]["entered"]
+                )
+
+                player_dict[player]["average_x"] = np.nanmean(
+                    self.processed_data[f"Player{player}_x"]
+                )
+                player_dict[player]["average_y"] = np.nanmean(
+                    self.processed_data[f"Player{player}_y"]
+                )
+
+                player_dict[player]["total_seconds"] = last_second - first_second
+                player_dict[player]["total_distance"] = np.nansum(
+                    self.processed_data[f"Player{player}_movement"]
+                )
+                player_dict[player]["average_speed_kmh"] = (
+                    (player_dict[player]["total_distance"] / 1000)
+                    / player_dict[player]["total_seconds"]
+                    * 60
+                    * 60
+                )
+
+                player_dict[player]["seconds_walking"] = sum(
+                    self.processed_data[f"Player{player}_movement"].between(0, 2)
+                )
+                player_dict[player]["seconds_jogging"] = sum(
+                    self.processed_data[f"Player{player}_movement"].between(2, 4)
+                )
+                player_dict[player]["seconds_running"] = sum(
+                    self.processed_data[f"Player{player}_movement"].between(4, 7)
+                )
+                player_dict[player]["seconds_sprinting"] = sum(
+                    self.processed_data[f"Player{player}_movement"].between(7, 12)
+                )
+
+        player_table = pd.DataFrame.from_dict(player_dict, orient="index")
+
+        return player_table
+
     def process_tracking_data(self, file_path):
         """Process raw data file
 
@@ -173,6 +273,8 @@ class TrackingReader:
 
         self.processed_data = self.average_per_second(clean_data)
 
+        self.postprocess_tracking_data()
+
         return clean_data
 
     def calculate_distance_per_player(self, player_no):
@@ -182,7 +284,7 @@ class TrackingReader:
             player_no (int): player number
 
         Returns:
-            float: distance run from player
+            dict: dict with total distance per player and list of distances
         """
         if self.processed_data is None:
             LOGGER.error(
@@ -193,11 +295,12 @@ class TrackingReader:
             player_no = "Player" + str(player_no)
             distance = []
 
-            distance_df = self.processed_data.dropna(subset=[player_no + "_x"])
+            distance_df = self.processed_data.fillna(0)
 
             for index, row in distance_df.iterrows():
                 if index == 0:
                     LOGGER.info("Calculating distance")
+                    distance.append(np.nan)
                 else:
                     calc_dist = self.__calculateDistance(
                         row[player_no + "_x"],
@@ -205,11 +308,18 @@ class TrackingReader:
                         distance_df.iloc[index - 1][player_no + "_x"],
                         distance_df.iloc[index - 1][player_no + "_y"],
                     )
-                    distance.append(calc_dist)
+                    if calc_dist > 12:
+                        distance.append(np.nan)
+                    else:
+                        distance.append(calc_dist)
 
-            return round(sum(distance), 2)
+            total_distance = np.nansum(distance)
 
-    def plot_heatmap_per_player(self, player_no):
+            output_dict = {"total_distance": total_distance, "distances": distance}
+
+            return output_dict
+
+    def plot_heatmap_per_player(self, player_no_input):
         """Plot heatmap for a given player
 
         Args:
@@ -221,8 +331,10 @@ class TrackingReader:
             )
 
         else:
-            player_no = "Player" + str(player_no)
-            heat_df = self.processed_data.dropna(subset=[player_no + "_x"])
+            player_no = "Player" + str(player_no_input)
+            heat_df = self.processed_data.dropna(
+                subset=[player_no + "_x", player_no + "_y"]
+            )
 
             x_ax = heat_df[player_no + "_x"].apply(lambda x: int(x))
 
@@ -236,9 +348,25 @@ class TrackingReader:
 
             heat = heat.reset_index()
 
-            heat = heat.pivot(index="y", columns="x", values="count").fillna(0)
+            heat["count"] = np.log(heat["count"])
 
-            plt.figure(figsize=(8, 60 / 106 * 8))
-            plt.rcParams["axes.facecolor"] = "lightgreen"
-            sns.heatmap(heat, cmap="hot_r")
-            plt.axis("off")
+            base_pitch = utils.create_base_pitch()
+
+            heat = base_pitch.merge(heat, how="left", on=["x", "y"])
+
+            heat = heat.pivot(index="y", columns="x", values="count")  # .fillna(0)
+
+            mask = heat.isnull()
+
+            fig, ax = utils.plot_pitch()
+            sns.heatmap(heat, cmap="hot_r", ax=ax, mask=mask)
+            plt.title(
+                f"Player {player_no_input} Heatmap",
+                fontsize=18,
+                fontweight="bold",
+                fontname="Arial",
+            )
+            cur_axes = plt.gca()
+            cur_axes.axes.get_xaxis().set_visible(False)
+            cur_axes.axes.get_yaxis().set_visible(False)
+            fig.delaxes(fig.axes[1])
